@@ -1,0 +1,86 @@
+.nfs*
+
+# compilation and distribution
+__pycache__
+_ext
+*.pyc
+*.pyd
+*.so
+*.dll
+*.egg-info/
+build/
+dist/
+wheels/
+
+# pytorch/python/numpy formats
+*.pth
+*.pkl
+*.npy
+*.ts
+model_ts*.txt
+
+# onnx models
+*.onnx
+
+# ipython/jupyter notebooks
+**/.ipynb_checkpoints/
+
+# Editor temporaries
+*.swn
+*.swo
+*.swp
+*~
+
+# editor settings
+.idea
+.vscode
+_darcs
+
+# demo 
+**/node_modules
+yarn.lock
+package-lock.json
+
+
+# Hidden files and folders
+.*
+
+# But keep this file tracked
+!.gitignore
+
+# Notebooks
+*.ipynb
+.ipynb_checkpoints/
+
+# Python/cache
+__pycache__/
+*.pyc
+
+# Data/results/logs
+data*/
+results*/
+logs*/
+*.log
+*.out
+*.err
+*.so
+*.o
+*.sh
+
+# Models/checkpoints
+*.pt
+*.pth
+*.ckpt
+*.h5
+
+# Enviroment files
+*.def
+*.sif
+
+# OS/editor files
+.DS_Store
+.vscode/*
+.idea/
+
+project.def
+project.sif
