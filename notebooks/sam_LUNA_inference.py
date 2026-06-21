@@ -104,6 +104,8 @@ def build_experiment_name(args: argparse.Namespace) -> str:
         parts.append(f"max-{args.max_cases}")
     if args.prompt_perturb_rmax > 0:
         parts.append(f"perturb-r{args.prompt_perturb_rmax}")
+    if args.box_size_perturb_px != 0:
+        parts.append(f"boxsize-{args.box_size_perturb_px:+d}px")
     if args.mode == "auto" or "auto" in args.image_outputs:
         parts.append(
             f"autoA{args.auto_min_area}-{args.auto_max_area}"
@@ -299,6 +301,40 @@ def pad_box_xyxy(box_xyxy: Sequence[float], image_shape_hw: Tuple[int, int], pad
     H, W = image_shape_hw
     x0, y0, x1, y1 = np.asarray(box_xyxy, dtype=np.float32).reshape(4).tolist()
     return clip_box_xyxy(np.array([x0 - pad, y0 - pad, x1 + pad, y1 + pad], dtype=np.float32), image_shape_hw)
+
+
+def resize_box_xyxy(
+    box_xyxy: Sequence[float],
+    image_shape_hw: Tuple[int, int],
+    delta_px: int,
+    min_size: int = 1,
+) -> np.ndarray:
+    """Resize a box by delta_px pixels in every direction.
+
+    delta_px = 0 keeps the box unchanged.
+    delta_px > 0 expands the box.
+    delta_px < 0 shrinks the box.
+    """
+    original = np.asarray(box_xyxy, dtype=np.float32).reshape(4)
+    x1, y1, x2, y2 = original.tolist()
+    d = int(delta_px)
+
+    resized = np.array([x1 - d, y1 - d, x2 + d, y2 + d], dtype=np.float32)
+    resized = clip_box_xyxy(resized, image_shape_hw)
+
+    # Avoid invalid boxes if the requested shrink is too large.
+    x1n, y1n, x2n, y2n = resized.tolist()
+    min_size = max(1, int(min_size))
+    if x2n - x1n < min_size:
+        cx = 0.5 * (x1 + x2)
+        x1n = cx - min_size / 2.0
+        x2n = cx + min_size / 2.0
+    if y2n - y1n < min_size:
+        cy = 0.5 * (y1 + y2)
+        y1n = cy - min_size / 2.0
+        y2n = cy + min_size / 2.0
+
+    return clip_box_xyxy(np.array([x1n, y1n, x2n, y2n], dtype=np.float32), image_shape_hw)
 
 
 def recenter_box_xyxy_at_point(box_xyxy: np.ndarray, center_xy: Sequence[float], image_shape_hw: Tuple[int, int]) -> np.ndarray:
@@ -523,7 +559,11 @@ def get_interior_point(component_mask: np.ndarray) -> List[float]:
     return [float(x), float(y)]
 
 
-def extract_blobs_from_slice(mask_2d: np.ndarray, pad_box: int = 0) -> List[Dict]:
+def extract_blobs_from_slice(
+    mask_2d: np.ndarray,
+    pad_box: int = 0,
+    box_size_perturb_px: int = 0,
+) -> List[Dict]:
     mask_bin = (mask_2d > 0).astype(np.uint8)
     contours, _ = cv2.findContours(mask_bin, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     blobs = []
@@ -539,6 +579,13 @@ def extract_blobs_from_slice(mask_2d: np.ndarray, pad_box: int = 0) -> List[Dict
         bbox = [int(x), int(y), int(x + w - 1), int(y + h - 1)]
         if pad_box > 0:
             bbox = pad_box_xyxy(bbox, image_shape_hw=(H, W), pad=pad_box).astype(np.float32).tolist()
+        if box_size_perturb_px != 0:
+            bbox = resize_box_xyxy(
+                bbox,
+                image_shape_hw=(H, W),
+                delta_px=box_size_perturb_px,
+                min_size=1,
+            ).astype(np.float32).tolist()
         blobs.append(
             {
                 "center": get_interior_point(component_mask),
@@ -551,14 +598,22 @@ def extract_blobs_from_slice(mask_2d: np.ndarray, pad_box: int = 0) -> List[Dict
     return blobs
 
 
-def build_slice_prompt_dict(mask_3d: np.ndarray, pad_box: int = 0) -> List[Dict]:
+def build_slice_prompt_dict(
+    mask_3d: np.ndarray,
+    pad_box: int = 0,
+    box_size_perturb_px: int = 0,
+) -> List[Dict]:
     mask_3d = (mask_3d > 0).astype(np.uint8)
     slice_dicts = []
     for z in range(mask_3d.shape[0]):
         mask_slice = mask_3d[z]
         if not np.any(mask_slice > 0):
             continue
-        blobs = extract_blobs_from_slice(mask_slice, pad_box=pad_box)
+        blobs = extract_blobs_from_slice(
+            mask_slice,
+            pad_box=pad_box,
+            box_size_perturb_px=box_size_perturb_px,
+        )
         if not blobs:
             continue
         slice_dicts.append(
@@ -731,7 +786,11 @@ def predict_image_single(
     args: argparse.Namespace,
     device: torch.device,
 ) -> Tuple[Dict, Dict[str, np.ndarray]]:
-    prompts = build_slice_prompt_dict(gt_volume, pad_box=args.image_pad_box)
+    prompts = build_slice_prompt_dict(
+        gt_volume,
+        pad_box=args.image_pad_box,
+        box_size_perturb_px=args.box_size_perturb_px,
+    )
     prompts = perturb_slice_prompt_dicts(
         prompts,
         series_id=series_id,
@@ -824,7 +883,11 @@ def predict_image_multi(
     args: argparse.Namespace,
     device: torch.device,
 ) -> Tuple[Dict, Dict[str, np.ndarray]]:
-    prompts = build_slice_prompt_dict(gt_volume, pad_box=args.image_pad_box)
+    prompts = build_slice_prompt_dict(
+        gt_volume,
+        pad_box=args.image_pad_box,
+        box_size_perturb_px=args.box_size_perturb_px,
+    )
     prompts = perturb_slice_prompt_dicts(
         prompts,
         series_id=series_id,
@@ -891,7 +954,11 @@ def predict_auto(
         z_list = list(range(image_array.shape[0]))
         n_prompt_slices = int(np.any(gt_volume > 0, axis=(1, 2)).sum())
     else:
-        prompts = build_slice_prompt_dict(gt_volume, pad_box=args.image_pad_box)
+        prompts = build_slice_prompt_dict(
+        gt_volume,
+        pad_box=args.image_pad_box,
+        box_size_perturb_px=args.box_size_perturb_px,
+    )
         if not prompts:
             raise ValueError("No valid GT-positive prompt slices found")
         z_list = sorted(int(d["z"]) for d in prompts)
@@ -964,6 +1031,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--image-pad-box", type=int, default=0, help="Padding in pixels around slice-wise prompt boxes.")
+    parser.add_argument(
+        "--box-size-perturb-px",
+        type=int,
+        default=0,
+        help=(
+            "Resize prompted boxes by this many pixels in every direction. "
+            "0 keeps the current box, positive values enlarge it, negative values shrink it."
+        ),
+    )
 
     # Automatic mask generator options
     parser.add_argument("--process-all-slices-auto", action="store_true", help="Run automatic mask generation on all CT slices. Default is only GT-positive slices to save time.")
@@ -1122,6 +1198,7 @@ def main() -> None:
                     "width": int(gt_volume.shape[2]),
                     "prompt_perturb_rmax": int(args.prompt_perturb_rmax),
                     "prompt_perturb_seed": int(args.seed),
+                    "box_size_perturb_px": int(args.box_size_perturb_px),
                     "model_type": str(args.model_type),
                 }
             )
