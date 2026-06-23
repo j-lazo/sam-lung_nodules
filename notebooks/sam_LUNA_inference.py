@@ -1031,15 +1031,8 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--image-pad-box", type=int, default=0, help="Padding in pixels around slice-wise prompt boxes.")
-    parser.add_argument(
-        "--box-size-perturb-px",
-        type=int,
-        default=0,
-        help=(
-            "Resize prompted boxes by this many pixels in every direction. "
-            "0 keeps the current box, positive values enlarge it, negative values shrink it."
-        ),
-    )
+    parser.add_argument("--box-size-perturb-px", type=int, default=0, help=("Resize prompted boxes by this many pixels in every direction. "
+                                                                            "0 keeps the current box, positive values enlarge it, negative values shrink it."),)
 
     # Automatic mask generator options
     parser.add_argument("--process-all-slices-auto", action="store_true", help="Run automatic mask generation on all CT slices. Default is only GT-positive slices to save time.")
