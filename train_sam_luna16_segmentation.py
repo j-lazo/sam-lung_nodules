@@ -123,31 +123,47 @@ def safe_autocast(device: torch.device, amp_dtype: str):
     return torch.autocast("cuda", dtype=dtype)
 
 
+def to_plain_python(obj):
+    """Recursively convert NumPy/Pandas/Path objects into YAML/JSON-safe Python types."""
+    if obj is None or isinstance(obj, (str, int, bool)):
+        return obj
+    if isinstance(obj, float):
+        return None if math.isnan(obj) or math.isinf(obj) else obj
+    if isinstance(obj, Path):
+        return str(obj)
+    if isinstance(obj, argparse.Namespace):
+        return {str(k): to_plain_python(v) for k, v in vars(obj).items()}
+    if isinstance(obj, dict):
+        return {str(to_plain_python(k)): to_plain_python(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple, set)):
+        return [to_plain_python(v) for v in obj]
+    if isinstance(obj, np.ndarray):
+        return [to_plain_python(v) for v in obj.tolist()]
+    if isinstance(obj, np.generic):
+        return to_plain_python(obj.item())
+    if pd.isna(obj):
+        return None
+    return str(obj)
+
+
 def namespace_to_plain_dict(args: argparse.Namespace) -> Dict:
-    out = {}
-    for k, v in vars(args).items():
-        if isinstance(v, Path):
-            out[k] = str(v)
-        elif isinstance(v, (tuple, list)):
-            out[k] = list(v)
-        else:
-            out[k] = v
-    return out
+    return to_plain_python(args)
 
 
 def write_config(path: Path, payload: Dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    payload = to_plain_python(payload)
     with open(path, "w") as f:
         if yaml is not None:
             yaml.safe_dump(payload, f, sort_keys=False, default_flow_style=False)
         else:
-            json.dump(payload, f, indent=2)
+            json.dump(payload, f, indent=2, allow_nan=False)
 
 
 def write_json(path: Path, payload) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w") as f:
-        json.dump(payload, f, indent=2)
+        json.dump(to_plain_python(payload), f, indent=2, allow_nan=False)
 
 
 def write_pred_volume(pred: np.ndarray, reference_image: sitk.Image, out_path: Path) -> None:
