@@ -125,24 +125,43 @@ def safe_autocast(device: torch.device, amp_dtype: str):
 
 def to_plain_python(obj):
     """Recursively convert NumPy/Pandas/Path objects into YAML/JSON-safe Python types."""
-    if obj is None or isinstance(obj, (str, int, bool)):
-        return obj
-    if isinstance(obj, float):
-        return None if math.isnan(obj) or math.isinf(obj) else obj
-    if isinstance(obj, Path):
-        return str(obj)
-    if isinstance(obj, argparse.Namespace):
-        return {str(k): to_plain_python(v) for k, v in vars(obj).items()}
-    if isinstance(obj, dict):
-        return {str(to_plain_python(k)): to_plain_python(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple, set)):
-        return [to_plain_python(v) for v in obj]
-    if isinstance(obj, np.ndarray):
-        return [to_plain_python(v) for v in obj.tolist()]
+
+    # Handle NumPy scalars before Python primitive checks.
+    # In particular, np.str_ can behave like str for isinstance(), but PyYAML
+    # still cannot serialize it unless it is converted to a native Python str.
     if isinstance(obj, np.generic):
         return to_plain_python(obj.item())
-    if pd.isna(obj):
+
+    if isinstance(obj, np.ndarray):
+        return [to_plain_python(v) for v in obj.tolist()]
+
+    if obj is None:
         return None
+
+    if isinstance(obj, Path):
+        return str(obj)
+
+    if isinstance(obj, argparse.Namespace):
+        return {str(k): to_plain_python(v) for k, v in vars(obj).items()}
+
+    if isinstance(obj, dict):
+        return {str(to_plain_python(k)): to_plain_python(v) for k, v in obj.items()}
+
+    if isinstance(obj, (list, tuple, set)):
+        return [to_plain_python(v) for v in obj]
+
+    if isinstance(obj, float):
+        return None if math.isnan(obj) or math.isinf(obj) else float(obj)
+
+    if isinstance(obj, (str, int, bool)):
+        return obj
+
+    try:
+        if pd.isna(obj):
+            return None
+    except Exception:
+        pass
+
     return str(obj)
 
 
@@ -516,7 +535,7 @@ def split_volume_ids(
     test_case_list: Optional[str] = None,
     shuffle_splits: bool = True,
 ) -> Dict[str, List[str]]:
-    available = list(volume_ids)
+    available = [str(x) for x in volume_ids]
     available_set = set(available)
     explicit_train = read_case_list_file(train_case_list)
     explicit_val = read_case_list_file(val_case_list)
@@ -546,7 +565,7 @@ def split_volume_ids(
     ids = list(available)
     if shuffle_splits:
         rng = np.random.default_rng(seed)
-        ids = list(rng.permutation(ids))
+        ids = [str(x) for x in rng.permutation(ids)]
 
     n_total = len(ids)
     n_test = int(round(n_total * test_ratio))
