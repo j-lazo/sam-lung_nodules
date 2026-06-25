@@ -674,12 +674,26 @@ class LUNAPositiveSliceSegDataset(Dataset):
 
 
 def collate_seg(batch: List[Dict]) -> Dict:
+    """Collate function shared by train/val/test slice datasets.
+
+    Some datasets include image_hw explicitly, while case-level evaluation
+    datasets may only provide image/mask/series_id/z. Build image_hw from the
+    mask shape as a fallback so the same collate function is safe in both paths.
+    """
+    if "image_hw" in batch[0]:
+        image_hw = torch.stack([b["image_hw"] for b in batch], dim=0)
+    else:
+        image_hw = torch.tensor(
+            [[int(b["mask"].shape[-2]), int(b["mask"].shape[-1])] for b in batch],
+            dtype=torch.long,
+        )
+
     return {
         "image": torch.stack([b["image"] for b in batch], dim=0),
         "mask": torch.stack([b["mask"] for b in batch], dim=0),
         "series_id": [b["series_id"] for b in batch],
         "z": torch.tensor([b["z"] for b in batch], dtype=torch.long),
-        "image_hw": torch.stack([b["image_hw"] for b in batch], dim=0),
+        "image_hw": image_hw,
     }
 
 
@@ -1073,11 +1087,13 @@ class CasePositiveSliceDataset(Dataset):
             hu_min=self.hu_min,
             hu_max=self.hu_max,
         )
+        H, W = self.case.gt_volume.shape[1:]
         return {
             "image": numpy_rgb_to_sam_tensor(rgb),
             "mask": torch.from_numpy(self.case.gt_volume[z].astype(np.float32))[None],
             "series_id": self.case.series_id,
             "z": int(z),
+            "image_hw": torch.tensor([H, W], dtype=torch.long),
         }
 
 
