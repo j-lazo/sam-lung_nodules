@@ -6,7 +6,7 @@ This script is for facebookresearch/segment-anything, not SAM2/MedSAM2.
 It trains a promptless binary segmentation model on LUNA-style nodule-positive
 2D/2.5D slices:
 
-    CT slice/triplet -> original SAM image encoder -> small segmentation head -> mask logits
+    CT slice/triplet -> original SAM image encoder -> selectable CNN decoder/head -> mask logits
 
 The SAM prompt encoder and SAM mask decoder are not used. This is intentional:
 it gives a simple fully-supervised baseline while still using SAM image features.
@@ -347,6 +347,102 @@ def build_sam_input_slice(
     return np.stack([ch, ch, ch], axis=-1)
 
 
+def resize_rgb_and_mask(rgb: np.ndarray, mask: np.ndarray, image_size: Optional[int]) -> Tuple[np.ndarray, np.ndarray]:
+    """Optionally resize a H,W,3 uint8 image and H,W binary mask to a square size."""
+    if image_size is None:
+        return rgb, mask
+    size = (int(image_size), int(image_size))
+    rgb_r = cv2.resize(rgb, size, interpolation=cv2.INTER_LINEAR)
+    mask_r = cv2.resize(mask.astype(np.uint8), size, interpolation=cv2.INTER_NEAREST)
+    return rgb_r, mask_r
+
+
+def resize_rgb_only(rgb: np.ndarray, image_size: Optional[int]) -> np.ndarray:
+    """Optionally resize a H,W,3 uint8 image to a square size."""
+    if image_size is None:
+        return rgb
+    size = (int(image_size), int(image_size))
+    return cv2.resize(rgb, size, interpolation=cv2.INTER_LINEAR)
+
+
+def build_augment_params(args: argparse.Namespace) -> Dict:
+    return {
+        "enabled": bool(args.augment),
+        "hflip_p": float(args.aug_hflip_p),
+        "vflip_p": float(args.aug_vflip_p),
+        "rotation_deg": float(args.aug_rotation_deg),
+        "shift_px": float(args.aug_shift_px),
+        "scale_min": float(args.aug_scale_min),
+        "scale_max": float(args.aug_scale_max),
+        "intensity_p": float(args.aug_intensity_p),
+        "brightness": float(args.aug_brightness),
+        "contrast": float(args.aug_contrast),
+        "noise_std": float(args.aug_noise_std),
+        "blur_p": float(args.aug_blur_p),
+    }
+
+
+def apply_train_augmentations(rgb: np.ndarray, mask: np.ndarray, params: Dict) -> Tuple[np.ndarray, np.ndarray]:
+    """Apply conservative 2D augmentations to a single training slice/mask pair.
+
+    Geometric transforms are shared by image and mask. Intensity transforms are
+    applied only to the image. The image remains uint8 H,W,3 and the mask remains
+    uint8 H,W. Augmentation is intentionally mild because LUNA nodules are small.
+    """
+    if not params or not params.get("enabled", False):
+        return rgb, mask
+
+    rgb = np.ascontiguousarray(rgb)
+    mask = np.ascontiguousarray(mask.astype(np.uint8))
+
+    if random.random() < params.get("hflip_p", 0.0):
+        rgb = np.ascontiguousarray(rgb[:, ::-1])
+        mask = np.ascontiguousarray(mask[:, ::-1])
+    if random.random() < params.get("vflip_p", 0.0):
+        rgb = np.ascontiguousarray(rgb[::-1, :])
+        mask = np.ascontiguousarray(mask[::-1, :])
+
+    H, W = mask.shape[:2]
+    rot = float(params.get("rotation_deg", 0.0))
+    shift = float(params.get("shift_px", 0.0))
+    scale_min = float(params.get("scale_min", 1.0))
+    scale_max = float(params.get("scale_max", 1.0))
+    if rot > 0 or shift > 0 or abs(scale_min - 1.0) > 1e-6 or abs(scale_max - 1.0) > 1e-6:
+        angle = random.uniform(-rot, rot) if rot > 0 else 0.0
+        scale = random.uniform(scale_min, scale_max) if scale_max > 0 else 1.0
+        tx = random.uniform(-shift, shift) if shift > 0 else 0.0
+        ty = random.uniform(-shift, shift) if shift > 0 else 0.0
+        M = cv2.getRotationMatrix2D((W / 2.0, H / 2.0), angle, scale)
+        M[0, 2] += tx
+        M[1, 2] += ty
+        rgb = cv2.warpAffine(
+            rgb, M, (W, H), flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_REFLECT_101,
+        )
+        mask = cv2.warpAffine(
+            mask, M, (W, H), flags=cv2.INTER_NEAREST,
+            borderMode=cv2.BORDER_CONSTANT, borderValue=0,
+        )
+
+    if random.random() < params.get("intensity_p", 0.0):
+        x = rgb.astype(np.float32)
+        contrast = float(params.get("contrast", 0.0))
+        brightness = float(params.get("brightness", 0.0))
+        if contrast > 0:
+            x *= random.uniform(1.0 - contrast, 1.0 + contrast)
+        if brightness > 0:
+            x += random.uniform(-brightness, brightness) * 255.0
+        noise_std = float(params.get("noise_std", 0.0))
+        if noise_std > 0:
+            x += np.random.normal(0.0, noise_std * 255.0, size=x.shape).astype(np.float32)
+        rgb = np.clip(x, 0.0, 255.0).astype(np.uint8)
+
+    if random.random() < params.get("blur_p", 0.0):
+        rgb = cv2.GaussianBlur(rgb, ksize=(3, 3), sigmaX=0.0)
+
+    return rgb.astype(np.uint8), (mask > 0).astype(np.uint8)
+
+
 def numpy_rgb_to_sam_tensor(rgb: np.ndarray) -> torch.Tensor:
     """H,W,3 uint8 -> 3,H,W float in [0,255]."""
     return torch.from_numpy(rgb).permute(2, 0, 1).float()
@@ -609,6 +705,8 @@ class LUNAPositiveSliceSegDataset(Dataset):
         hu_max: float,
         min_component_area: int,
         cache_cases: bool = False,
+        image_size: Optional[int] = None,
+        augment_params: Optional[Dict] = None,
     ):
         self.index = index
         self.volume_ids = list(volume_ids)
@@ -618,6 +716,8 @@ class LUNAPositiveSliceSegDataset(Dataset):
         self.hu_max = hu_max
         self.min_component_area = min_component_area
         self.cache_cases = cache_cases
+        self.image_size = image_size
+        self.augment_params = augment_params or {"enabled": False}
         self._case_cache: Dict[str, CaseData] = {}
         self.samples = self._build_samples()
         if not self.samples:
@@ -661,17 +761,19 @@ class LUNAPositiveSliceSegDataset(Dataset):
             hu_min=self.hu_min,
             hu_max=self.hu_max,
         )
+        mask = case.gt_volume[s.z].astype(np.uint8)
+        rgb, mask = resize_rgb_and_mask(rgb, mask, self.image_size)
+        rgb, mask = apply_train_augmentations(rgb, mask, self.augment_params)
         image = numpy_rgb_to_sam_tensor(rgb)
-        mask = torch.from_numpy(case.gt_volume[s.z].astype(np.float32))[None]
-        H, W = case.gt_volume.shape[1:]
+        mask_t = torch.from_numpy(mask.astype(np.float32))[None]
+        H, W = mask.shape
         return {
             "image": image,
-            "mask": mask,
+            "mask": mask_t,
             "series_id": s.series_id,
             "z": int(s.z),
             "image_hw": torch.tensor([H, W], dtype=torch.long),
         }
-
 
 def collate_seg(batch: List[Dict]) -> Dict:
     """Collate function shared by train/val/test slice datasets.
@@ -703,23 +805,90 @@ def collate_seg(batch: List[Dict]) -> Dict:
 
 
 class ConvGNAct(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int, groups: int = 8):
+    def __init__(self, in_ch: int, out_ch: int, groups: int = 8, dropout: float = 0.0):
         super().__init__()
         g = min(groups, out_ch)
         while out_ch % g != 0 and g > 1:
             g -= 1
-        self.net = nn.Sequential(
+        layers: List[nn.Module] = [
             nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1),
             nn.GroupNorm(g, out_ch),
             nn.GELU(),
-        )
+        ]
+        if dropout > 0:
+            layers.append(nn.Dropout2d(p=float(dropout)))
+        self.net = nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
 
 
+class SimpleDecoder(nn.Module):
+    """Original lightweight decoder: refine final SAM image embedding, then predict."""
+
+    def __init__(self, in_ch: int = 256, decoder_dim: int = 256, dropout: float = 0.0):
+        super().__init__()
+        self.net = nn.Sequential(
+            ConvGNAct(in_ch, decoder_dim, dropout=dropout),
+            ConvGNAct(decoder_dim, decoder_dim, dropout=dropout),
+            nn.Conv2d(decoder_dim, 1, kernel_size=1),
+        )
+
+    def forward(self, feat: torch.Tensor) -> torch.Tensor:
+        return self.net(feat)
+
+
+class DeepDecoder(nn.Module):
+    """Deeper low-resolution decoder using only the final SAM image embedding."""
+
+    def __init__(self, in_ch: int = 256, decoder_dim: int = 256, depth: int = 4, dropout: float = 0.0):
+        super().__init__()
+        depth = max(1, int(depth))
+        layers: List[nn.Module] = [ConvGNAct(in_ch, decoder_dim, dropout=dropout)]
+        for _ in range(depth):
+            layers.append(ConvGNAct(decoder_dim, decoder_dim, dropout=dropout))
+        layers.append(nn.Conv2d(decoder_dim, 1, kernel_size=1))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, feat: torch.Tensor) -> torch.Tensor:
+        return self.net(feat)
+
+
+class ProgressiveUpsampleDecoder(nn.Module):
+    """U-Net/FPN-style progressive upsampling decoder for original SAM.
+
+    Original SAM's public image encoder returns a final dense embedding rather than
+    the multi-scale feature pyramid returned by SAM2. Therefore, for original SAM,
+    --decoder-type fpn means a top-down/progressive upsampling decoder starting
+    from the final SAM embedding. It does not use true encoder skip connections,
+    but it gives the decoder several higher-resolution refinement stages before
+    the final mask prediction.
+    """
+
+    def __init__(self, in_ch: int = 256, decoder_dim: int = 256, num_levels: int = 3, smooth_blocks: int = 1, dropout: float = 0.0):
+        super().__init__()
+        self.num_levels = max(1, int(num_levels))
+        smooth_blocks = max(1, int(smooth_blocks))
+        self.proj = ConvGNAct(in_ch, decoder_dim, dropout=dropout)
+        self.level_blocks = nn.ModuleList()
+        for _ in range(self.num_levels):
+            blocks: List[nn.Module] = []
+            for _ in range(smooth_blocks):
+                blocks.append(ConvGNAct(decoder_dim, decoder_dim, dropout=dropout))
+            self.level_blocks.append(nn.Sequential(*blocks))
+        self.out_conv = nn.Conv2d(decoder_dim, 1, kernel_size=1)
+
+    def forward(self, feat: torch.Tensor) -> torch.Tensor:
+        x = self.proj(feat)
+        for i, block in enumerate(self.level_blocks):
+            if i > 0:
+                x = F.interpolate(x, scale_factor=2.0, mode="bilinear", align_corners=False)
+            x = block(x)
+        return self.out_conv(x)
+
+
 class SAMEncoderSegmentationModel(nn.Module):
-    """Original SAM image encoder + supervised segmentation head."""
+    """Original SAM image encoder + selectable supervised segmentation decoder."""
 
     def __init__(
         self,
@@ -727,11 +896,16 @@ class SAMEncoderSegmentationModel(nn.Module):
         head_dim: int = 256,
         freeze_encoder: bool = True,
         sam_feature_channels: int = 256,
+        decoder_type: str = "simple",
+        decoder_depth: int = 4,
+        fpn_levels: int = 3,
+        decoder_dropout: float = 0.0,
     ):
         super().__init__()
         self.sam = sam_model
         self.image_encoder = sam_model.image_encoder
         self.freeze_encoder = bool(freeze_encoder)
+        self.decoder_type = str(decoder_type)
         self.image_size = int(getattr(self.image_encoder, "img_size", 1024))
 
         # Only the image encoder is used. Keep prompt/mask decoders frozen because they are unused.
@@ -747,15 +921,23 @@ class SAMEncoderSegmentationModel(nn.Module):
         self.register_buffer("pixel_mean", pixel_mean.detach().clone().float().view(1, 3, 1, 1), persistent=False)
         self.register_buffer("pixel_std", pixel_std.detach().clone().float().view(1, 3, 1, 1), persistent=False)
 
-        self.seg_head = nn.Sequential(
-            ConvGNAct(sam_feature_channels, head_dim),
-            ConvGNAct(head_dim, head_dim),
-            nn.Conv2d(head_dim, 1, kernel_size=1),
-        )
+        if self.decoder_type == "simple":
+            self.seg_head = SimpleDecoder(in_ch=sam_feature_channels, decoder_dim=head_dim, dropout=decoder_dropout)
+        elif self.decoder_type == "deep":
+            self.seg_head = DeepDecoder(in_ch=sam_feature_channels, decoder_dim=head_dim, depth=decoder_depth, dropout=decoder_dropout)
+        elif self.decoder_type == "fpn":
+            self.seg_head = ProgressiveUpsampleDecoder(
+                in_ch=sam_feature_channels,
+                decoder_dim=head_dim,
+                num_levels=fpn_levels,
+                smooth_blocks=decoder_depth,
+                dropout=decoder_dropout,
+            )
+        else:
+            raise ValueError(f"Unknown decoder_type={decoder_type!r}. Use simple, deep, or fpn.")
 
     def preprocess_for_sam_encoder(self, x: torch.Tensor) -> torch.Tensor:
-        # x is B,3,H,W in [0,255]. For LUNA this is normally 512x512, so resizing
-        # to SAM's 1024x1024 input keeps aspect ratio because slices are square.
+        # x is B,3,H,W in [0,255]. It is resized to SAM's fixed encoder size.
         x = F.interpolate(x, size=(self.image_size, self.image_size), mode="bilinear", align_corners=False)
         x = (x - self.pixel_mean.to(dtype=x.dtype)) / self.pixel_std.to(dtype=x.dtype)
         return x
@@ -773,8 +955,8 @@ class SAMEncoderSegmentationModel(nn.Module):
         if output_hw is None:
             output_hw = tuple(x.shape[-2:])
         feat = self.extract_features(x)
-        logits = self.seg_head(feat)
-        logits = F.interpolate(logits, size=output_hw, mode="bilinear", align_corners=False)
+        logits_low = self.seg_head(feat)
+        logits = F.interpolate(logits_low, size=output_hw, mode="bilinear", align_corners=False)
         return logits
 
 
@@ -788,14 +970,18 @@ def build_sam_model(args: argparse.Namespace, device: torch.device):
 
 def build_seg_model(args: argparse.Namespace, device: torch.device) -> SAMEncoderSegmentationModel:
     sam = build_sam_model(args, device)
+    decoder_dim = args.decoder_dim if args.decoder_dim is not None else args.head_dim
     model = SAMEncoderSegmentationModel(
         sam_model=sam,
-        head_dim=args.head_dim,
+        head_dim=decoder_dim,
         freeze_encoder=not args.unfreeze_encoder,
         sam_feature_channels=args.sam_feature_channels,
+        decoder_type=args.decoder_type,
+        decoder_depth=args.decoder_depth,
+        fpn_levels=args.fpn_levels,
+        decoder_dropout=args.decoder_dropout,
     ).to(device)
     return model
-
 
 # =============================================================================
 # Losses
@@ -841,6 +1027,10 @@ def build_experiment_name(args: argparse.Namespace) -> str:
         args.run_name,
         "sam-posslice-seg",
         args.model_type,
+        f"dec-{args.decoder_type}",
+        f"ddim{args.decoder_dim if args.decoder_dim is not None else args.head_dim}",
+        "aug" if args.augment else "noaug",
+        f"sz{args.image_size}" if args.image_size else "native",
         "triplet" if args.use_triplet_channels else "singlech",
         "window" if args.use_ct_window else "normslice",
         f"ep{args.epochs}",
@@ -1066,12 +1256,22 @@ def summarize_by_patient(df: pd.DataFrame, id_col: str, metric_cols: Sequence[st
 
 
 class CasePositiveSliceDataset(Dataset):
-    def __init__(self, case: CaseData, use_triplet_channels: bool, use_ct_window: bool, hu_min: float, hu_max: float, min_component_area: int):
+    def __init__(
+        self,
+        case: CaseData,
+        use_triplet_channels: bool,
+        use_ct_window: bool,
+        hu_min: float,
+        hu_max: float,
+        min_component_area: int,
+        image_size: Optional[int] = None,
+    ):
         self.case = case
         self.use_triplet_channels = use_triplet_channels
         self.use_ct_window = use_ct_window
         self.hu_min = hu_min
         self.hu_max = hu_max
+        self.image_size = image_size
         self.zs = positive_slices_for_case(case, min_component_area=min_component_area)
 
     def __len__(self) -> int:
@@ -1087,6 +1287,10 @@ class CasePositiveSliceDataset(Dataset):
             hu_min=self.hu_min,
             hu_max=self.hu_max,
         )
+        # Use the same optional image resize at evaluation as during training.
+        # Keep the target mask at native resolution; the model forward call passes
+        # output_hw=(native_H, native_W), so predictions are written back correctly.
+        rgb = resize_rgb_only(rgb, self.image_size)
         H, W = self.case.gt_volume.shape[1:]
         return {
             "image": numpy_rgb_to_sam_tensor(rgb),
@@ -1095,7 +1299,6 @@ class CasePositiveSliceDataset(Dataset):
             "z": int(z),
             "image_hw": torch.tensor([H, W], dtype=torch.long),
         }
-
 
 def predict_case_positive_slices(
     model: SAMEncoderSegmentationModel,
@@ -1110,6 +1313,7 @@ def predict_case_positive_slices(
         hu_min=args.hu_min,
         hu_max=args.hu_max,
         min_component_area=args.min_component_area,
+        image_size=args.image_size,
     )
     pred_volume = np.zeros_like(case.gt_volume, dtype=np.uint8)
     slice_rows: List[Dict] = []
@@ -1343,6 +1547,8 @@ def train(args: argparse.Namespace) -> None:
         hu_max=args.hu_max,
         min_component_area=args.min_component_area,
         cache_cases=args.cache_cases,
+        image_size=args.image_size,
+        augment_params=build_augment_params(args),
     )
     val_ids = splits["val"] if splits["val"] else splits["train"]
     val_ds = LUNAPositiveSliceSegDataset(
@@ -1354,6 +1560,8 @@ def train(args: argparse.Namespace) -> None:
         hu_max=args.hu_max,
         min_component_area=args.min_component_area,
         cache_cases=args.cache_cases,
+        image_size=args.image_size,
+        augment_params={"enabled": False},
     )
 
     train_loader = DataLoader(
@@ -1379,6 +1587,8 @@ def train(args: argparse.Namespace) -> None:
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     if not trainable_params:
         raise RuntimeError("No trainable parameters. This should not happen because the segmentation head should be trainable.")
+    print(f"Decoder: type={args.decoder_type}, dim={args.decoder_dim if args.decoder_dim is not None else args.head_dim}, depth={args.decoder_depth}, fpn_levels={args.fpn_levels}, dropout={args.decoder_dropout}")
+    print(f"Augmentation enabled: {args.augment}")
     optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(args.epochs, 1))
     scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda" and args.amp_dtype == "fp16"))
@@ -1476,7 +1686,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-type", default="vit_h", choices=["default", "vit_h", "vit_l", "vit_b"])
     parser.add_argument("--checkpoint", required=True, help="Original SAM checkpoint, e.g. sam_vit_h_4b8939.pth")
     parser.add_argument("--sam-feature-channels", type=int, default=256, help="SAM image encoder output channels. Original SAM ViT models normally use 256.")
-    parser.add_argument("--head-dim", type=int, default=256)
+    parser.add_argument("--head-dim", type=int, default=256, help="Backward-compatible decoder channel width. Used when --decoder-dim is not set.")
+    parser.add_argument("--decoder-type", choices=["simple", "deep", "fpn"], default="simple", help="Segmentation decoder/head. simple keeps the original head, deep uses more conv blocks, fpn uses progressive U-Net/FPN-style upsampling from the final SAM embedding.")
+    parser.add_argument("--decoder-dim", type=int, default=None, help="Decoder channel width. If omitted, --head-dim is used for backward compatibility.")
+    parser.add_argument("--decoder-depth", type=int, default=4, help="For deep: number of ConvGNAct blocks. For fpn: smoothing ConvGNAct blocks per upsampling level.")
+    parser.add_argument("--fpn-levels", type=int, default=3, help="For original SAM, number of progressive upsampling/refinement levels when --decoder-type fpn.")
+    parser.add_argument("--decoder-dropout", type=float, default=0.0, help="Optional Dropout2d probability inside decoder blocks.")
     parser.add_argument("--unfreeze-encoder", action="store_true", help="Fine-tune SAM image encoder as well as the segmentation head.")
 
     # Runtime/training
@@ -1497,11 +1712,26 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-delta", type=float, default=1e-5)
     parser.add_argument("--cache-cases", action="store_true")
 
+    # Augmentation; applied only to the training split after optional resize.
+    parser.add_argument("--augment", action=argparse.BooleanOptionalAction, default=False, help="Enable conservative 2D augmentations for training slices only.")
+    parser.add_argument("--aug-hflip-p", type=float, default=0.5)
+    parser.add_argument("--aug-vflip-p", type=float, default=0.5)
+    parser.add_argument("--aug-rotation-deg", type=float, default=15.0)
+    parser.add_argument("--aug-shift-px", type=float, default=16.0)
+    parser.add_argument("--aug-scale-min", type=float, default=0.90)
+    parser.add_argument("--aug-scale-max", type=float, default=1.10)
+    parser.add_argument("--aug-intensity-p", type=float, default=0.8)
+    parser.add_argument("--aug-brightness", type=float, default=0.10, help="Brightness jitter as a fraction of 255.")
+    parser.add_argument("--aug-contrast", type=float, default=0.10, help="Contrast jitter fraction around 1.0.")
+    parser.add_argument("--aug-noise-std", type=float, default=0.02, help="Gaussian noise std as a fraction of 255.")
+    parser.add_argument("--aug-blur-p", type=float, default=0.10, help="Probability of mild 3x3 Gaussian blur.")
+
     # CT/slice input
     parser.add_argument("--use-triplet-channels", action="store_true", help="Use z-1/z/z+1 as RGB channels.")
     parser.add_argument("--use-ct-window", action=argparse.BooleanOptionalAction, default=True, help="Use fixed CT window before uint8 conversion. If false, per-slice min-max normalization is used.")
     parser.add_argument("--hu-min", type=float, default=-1000.0)
     parser.add_argument("--hu-max", type=float, default=400.0)
+    parser.add_argument("--image-size", type=int, default=None, help="Optional square resize before SAM preprocessing. Training masks are resized to this size; evaluation predictions are written back at native size.")
     parser.add_argument("--min-component-area", type=int, default=1)
 
     # Outputs
@@ -1537,6 +1767,16 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("Need non-negative --bce-weight/--dice-weight with positive sum")
     if not (0 <= args.threshold <= 1):
         raise ValueError("--threshold must be in [0,1]")
+    if args.image_size is not None and args.image_size <= 0:
+        raise ValueError("--image-size must be positive when provided")
+    if args.decoder_dim is not None and args.decoder_dim <= 0:
+        raise ValueError("--decoder-dim must be positive when provided")
+    if args.decoder_depth <= 0:
+        raise ValueError("--decoder-depth must be positive")
+    if args.fpn_levels <= 0:
+        raise ValueError("--fpn-levels must be positive")
+    if not (0.0 <= args.decoder_dropout < 1.0):
+        raise ValueError("--decoder-dropout must be in [0,1)")
 
 
 def main() -> None:
